@@ -45,6 +45,7 @@ class Config:
     noise_clip: float = 0.5
     policy_freq: int = 2
     normalize_q: bool = True
+    use_tanh: bool = False
     # training params
     dataset_name: str = "halfcheetah-medium-v2"
     batch_size: int = 1024
@@ -246,7 +247,7 @@ def main(config: Config):
     )
 
     critic_module = EnsembleCritic(hidden_dim=config.hidden_dim, num_critics=2, layernorm=config.critic_ln,
-                                   n_hiddens=config.critic_n_hiddens)
+                                   n_hiddens=config.critic_n_hiddens, use_tanh=config.use_tanh,)
     critic = CriticTrainState.create(
         apply_fn=critic_module.apply,
         params=critic_module.init(critic_key, init_state, init_action),
