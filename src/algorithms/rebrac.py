@@ -45,6 +45,7 @@ class Config:
     noise_clip: float = 0.5
     policy_freq: int = 2
     normalize_q: bool = True
+    use_tanh: bool = False
     # training params
     dataset_name: str = "halfcheetah-medium-v2"
     batch_size: int = 1024
@@ -138,11 +139,12 @@ def update_critic(
         noise_clip,
     )
     next_actions = jax.numpy.clip(next_actions + noise, -1, 1)
+
     bc_penalty = ((next_actions - batch["next_actions"]) ** 2).sum(-1)
     next_q = critic.apply_fn(critic.target_params, batch["next_states"], next_actions).min(0)
+    # lower_bounds = jax.numpy.repeat(batch['mc_returns'].reshape(-1, 1), next_q.shape[1], axis=1)
     next_q = next_q - beta * bc_penalty
-
-    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q
+    target_q = jax.numpy.maximum(batch["rewards"] + (1 - batch["dones"]) * gamma * next_q, batch['mc_returns'])
 
     def critic_loss_fn(critic_params):
         # [N, batch_size] - [1, batch_size]
@@ -225,7 +227,7 @@ def main(config: Config):
     )
     wandb.mark_preempting()
     buffer = ReplayBuffer()
-    buffer.create_from_d4rl(config.dataset_name, config.normalize_reward, config.normalize_states)
+    buffer.create_from_d4rl(config.dataset_name, config.normalize_reward, config.normalize_states, discount=config.gamma)
 
     key = jax.random.PRNGKey(seed=config.train_seed)
     key, actor_key, critic_key = jax.random.split(key, 3)
@@ -245,7 +247,7 @@ def main(config: Config):
     )
 
     critic_module = EnsembleCritic(hidden_dim=config.hidden_dim, num_critics=2, layernorm=config.critic_ln,
-                                   n_hiddens=config.critic_n_hiddens)
+                                   n_hiddens=config.critic_n_hiddens, use_tanh=config.use_tanh,)
     critic = CriticTrainState.create(
         apply_fn=critic_module.apply,
         params=critic_module.init(critic_key, init_state, init_action),
@@ -329,7 +331,7 @@ def main(config: Config):
         wandb.log({"epoch": epoch, **{f"ReBRAC/{k}": v for k, v in mean_metrics.items()}})
 
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
-            eval_returns = evaluate(eval_env, update_carry["actor"].params, actor_action_fn, config.eval_episodes,
+            eval_returns, success_rate = evaluate(eval_env, update_carry["actor"].params, actor_action_fn, config.eval_episodes,
                                     seed=config.eval_seed)
             normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
             wandb.log({

@@ -13,9 +13,37 @@ from typing import Dict, Tuple
 from src.utils.vd4rl_utils import ExtendedTimeStep, step_type_lookup
 
 
+def calc_return_to_go(is_sparse_reward, rewards, terminals, gamma):
+    """
+    A config dict for getting the default high/low rewrd values for each envs
+    This is used in calc_return_to_go func in sampler.py and replay_buffer.py
+    """
+    if len(rewards) == 0:
+        return []
+    reward_neg = 0
+    if is_sparse_reward and np.all(np.array(rewards) == reward_neg):
+        """
+        If the env has sparse reward and the trajectory is all negative rewards,
+        we use r / (1-gamma) as return to go.
+        For exapmle, if gamma = 0.99 and the rewards = [-1, -1, -1],
+        then return_to_go = [-100, -100, -100]
+        """
+        # assuming failure reward is negative
+        # use r / (1-gamma) for negative trajctory
+        return_to_go = [float(reward_neg / (1 - gamma))] * len(rewards)
+    else:
+        return_to_go = [0] * len(rewards)
+        prev_return = 0
+        for i in range(len(rewards)):
+            return_to_go[-i - 1] = rewards[-i - 1] + gamma * prev_return * (1 - terminals[-i - 1])
+            prev_return = return_to_go[-i - 1]
+
+    return return_to_go
+
+
 # source: https://github.com/rail-berkeley/d4rl/blob/d842aa194b416e564e54b0730d9f934e3e32f854/d4rl/__init__.py#L63
 # modified to also return next_action (needed for logging and in general useful to have)
-def qlearning_dataset(env, dataset=None, terminate_on_end=False, **kwargs):
+def qlearning_dataset(env, dataset_name, normalize_reward=False, dataset=None, terminate_on_end=False, discount=0.99, **kwargs):
     """
     Returns datasets formatted for use by standard Q-learning algorithms,
     with observations, actions, next_observations, next_actins, rewards,
@@ -39,21 +67,30 @@ def qlearning_dataset(env, dataset=None, terminate_on_end=False, **kwargs):
     """
     if dataset is None:
         dataset = env.get_dataset(**kwargs)
-
+    if normalize_reward:
+        dataset['rewards'] = ReplayBuffer.normalize_reward(dataset_name, dataset['rewards'])
     N = dataset['rewards'].shape[0]
+    is_sparse = "antmaze" in dataset_name
     obs_ = []
     next_obs_ = []
     action_ = []
     next_action_ = []
     reward_ = []
     done_ = []
-
+    mc_returns_ = []
+    print("SIZE", N)
     # The newer version of the dataset adds an explicit
     # timeouts field. Keep old method for backwards compatability.
     use_timeouts = 'timeouts' in dataset
 
     episode_step = 0
+    episode_rewards = []
+    episode_terminals = []
     for i in range(N - 1):
+        if episode_step == 0:
+            episode_rewards = []
+            episode_terminals = []
+
         obs = dataset['observations'][i].astype(np.float32)
         new_obs = dataset['observations'][i + 1].astype(np.float32)
         action = dataset['actions'][i].astype(np.float32)
@@ -68,9 +105,16 @@ def qlearning_dataset(env, dataset=None, terminate_on_end=False, **kwargs):
         if (not terminate_on_end) and final_timestep:
             # Skip this transition and don't apply terminals on the last step of an episode
             episode_step = 0
+            mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
+            # print(len(mc_returns_), len(episode_rewards), end=";")
             continue
         if done_bool or final_timestep:
             episode_step = 0
+            # mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
+            # print(i, len(mc_returns_), len(episode_rewards))
+
+        episode_rewards.append(reward)
+        episode_terminals.append(done_bool)
 
         obs_.append(obs)
         next_obs_.append(new_obs)
@@ -79,7 +123,10 @@ def qlearning_dataset(env, dataset=None, terminate_on_end=False, **kwargs):
         reward_.append(reward)
         done_.append(done_bool)
         episode_step += 1
-
+    if episode_step != 0:
+        mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
+    print("SHAPE", np.array(mc_returns_).shape, np.array(reward_).shape, np.array(done_).shape)
+    assert np.array(mc_returns_).shape == np.array(reward_).shape
     return {
         'observations': np.array(obs_),
         'actions': np.array(action_),
@@ -87,6 +134,7 @@ def qlearning_dataset(env, dataset=None, terminate_on_end=False, **kwargs):
         'next_actions': np.array(next_action_),
         'rewards': np.array(reward_),
         'terminals': np.array(done_),
+        'mc_returns': np.array(mc_returns_),
     }
 
 
@@ -107,15 +155,16 @@ class ReplayBuffer:
     std: float = 1
 
     def create_from_d4rl(self, dataset_name: str, normalize_reward: bool = False,
-                         normalize: bool = False):
-        d4rl_data = qlearning_dataset(gym.make(dataset_name))
+                         normalize: bool = False, discount=0.99):
+        d4rl_data = qlearning_dataset(gym.make(dataset_name), dataset_name=dataset_name, normalize_reward=normalize_reward, discount=discount)
         buffer = {
             "states": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
             "actions": jnp.asarray(d4rl_data["actions"], dtype=jnp.float32),
             "rewards": jnp.asarray(d4rl_data["rewards"], dtype=jnp.float32),
             "next_states": jnp.asarray(d4rl_data["next_observations"], dtype=jnp.float32),
             "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
-            "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32)
+            "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32),
+            "mc_returns": jnp.asarray(d4rl_data["mc_returns"], dtype=jnp.float32),
         }
         if normalize:
             self.mean, self.std = compute_mean_std(buffer["states"], eps=1e-3)
@@ -125,8 +174,8 @@ class ReplayBuffer:
             buffer["next_states"] = normalize_states(
                 buffer["next_states"], self.mean, self.std
             )
-        if normalize_reward:
-            buffer["rewards"] = ReplayBuffer.normalize_reward(dataset_name, buffer["rewards"])
+        # if normalize_reward:
+        #     buffer["rewards"] = ReplayBuffer.normalize_reward(dataset_name, buffer["rewards"])
         self.data = buffer
 
     @property
@@ -334,3 +383,175 @@ def add_offline_data_to_buffer(offline_data: dict, replay_buffer: EfficientRepla
                 stacked_frames.append(time_step.observation)
             time_step_stack = time_step._replace(observation=np.concatenate(stacked_frames, axis=0))
             replay_buffer.add(time_step_stack)
+
+
+class Dataset(object):
+    def __init__(self, observations: np.ndarray, actions: np.ndarray,
+                 rewards: np.ndarray, masks: np.ndarray,
+                 dones_float: np.ndarray, next_observations: np.ndarray,
+                 next_actions: np.ndarray,
+                 mc_returns: np.ndarray,
+                 size: int):
+        self.observations = observations
+        self.actions = actions
+        self.rewards = rewards
+        self.masks = masks
+        self.dones_float = dones_float
+        self.next_observations = next_observations
+        self.next_actions = next_actions
+        self.mc_returns = mc_returns
+        self.size = size
+
+    def sample(self, batch_size: int) -> Dict[str, np.ndarray]:
+        indx = np.random.randint(self.size, size=batch_size)
+        return {
+            "states": self.observations[indx],
+            "actions": self.actions[indx],
+            "rewards": self.rewards[indx],
+            "dones": self.dones_float[indx],
+            "next_states": self.next_observations[indx],
+            "next_actions": self.next_actions[indx],
+            "mc_returns": self.mc_returns[indx],
+        }
+
+
+class OnlineReplayBuffer(Dataset):
+    def __init__(self, observation_space: gym.spaces.Box, action_dim: int,
+                 capacity: int):
+
+        observations = np.empty((capacity, *observation_space.shape),
+                                dtype=observation_space.dtype)
+        actions = np.empty((capacity, action_dim), dtype=np.float32)
+        rewards = np.empty((capacity,), dtype=np.float32)
+        mc_returns = np.empty((capacity,), dtype=np.float32)
+        masks = np.empty((capacity,), dtype=np.float32)
+        dones_float = np.empty((capacity,), dtype=np.float32)
+        next_observations = np.empty((capacity, *observation_space.shape),
+                                     dtype=observation_space.dtype)
+        next_actions = np.empty((capacity, action_dim), dtype=np.float32)
+        super().__init__(observations=observations,
+                         actions=actions,
+                         rewards=rewards,
+                         masks=masks,
+                         dones_float=dones_float,
+                         next_observations=next_observations,
+                         next_actions=next_actions,
+                         mc_returns=mc_returns,
+                         size=0)
+
+        self.size = 0
+
+        self.insert_index = 0
+        self.capacity = capacity
+
+    def initialize_with_dataset(self, dataset: Dataset,
+                                num_samples=None):
+        assert self.insert_index == 0, 'Can insert a batch online in an empty replay buffer.'
+
+        dataset_size = len(dataset.observations)
+
+        if num_samples is None:
+            num_samples = dataset_size
+        else:
+            num_samples = min(dataset_size, num_samples)
+        assert self.capacity >= num_samples, 'Dataset cannot be larger than the replay buffer capacity.'
+
+        if num_samples < dataset_size:
+            perm = np.random.permutation(dataset_size)
+            indices = perm[:num_samples]
+        else:
+            indices = np.arange(num_samples)
+
+        self.observations[:num_samples] = dataset.observations[indices]
+        self.actions[:num_samples] = dataset.actions[indices]
+        self.rewards[:num_samples] = dataset.rewards[indices]
+        self.masks[:num_samples] = dataset.masks[indices]
+        self.dones_float[:num_samples] = dataset.dones_float[indices]
+        self.next_observations[:num_samples] = dataset.next_observations[
+            indices]
+        self.next_actions[:num_samples] = dataset.next_actions[
+            indices]
+        self.mc_returns[:num_samples] = dataset.mc_returns[indices]
+
+        self.insert_index = num_samples
+        self.size = num_samples
+
+    def insert(self, observation: np.ndarray, action: np.ndarray,
+               reward: float, mask: float, done_float: float,
+               next_observation: np.ndarray,
+               next_action: np.ndarray, mc_return: np.ndarray):
+        self.observations[self.insert_index] = observation
+        self.actions[self.insert_index] = action
+        self.rewards[self.insert_index] = reward
+        self.masks[self.insert_index] = mask
+        self.dones_float[self.insert_index] = done_float
+        self.next_observations[self.insert_index] = next_observation
+        self.next_actions[self.insert_index] = next_action
+        self.mc_returns[self.insert_index] = mc_return
+
+        self.insert_index = (self.insert_index + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+
+
+class D4RLDataset(Dataset):
+    def __init__(self,
+                 env: gym.Env,
+                 env_name: str,
+                 normalize_reward: bool,
+                 discount: float,
+                 clip_to_eps: bool = False,
+                 eps: float = 1e-5):
+
+        d4rl_data = qlearning_dataset(env, env_name, normalize_reward=normalize_reward, discount=discount)
+        dataset = {
+            "states": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
+            "actions": jnp.asarray(d4rl_data["actions"], dtype=jnp.float32),
+            "rewards": jnp.asarray(d4rl_data["rewards"], dtype=jnp.float32),
+            "next_states": jnp.asarray(d4rl_data["next_observations"], dtype=jnp.float32),
+            "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
+            "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32),
+            "mc_returns": jnp.asarray(d4rl_data["mc_returns"], dtype=jnp.float32)
+        }
+
+        super().__init__(dataset['states'].astype(np.float32),
+                         actions=dataset['actions'].astype(np.float32),
+                         rewards=dataset['rewards'].astype(np.float32),
+                         masks=1.0 - dataset['dones'].astype(np.float32),
+                         dones_float=dataset['dones'].astype(np.float32),
+                         next_observations=dataset['next_states'].astype(
+                             np.float32),
+                         next_actions=dataset["next_actions"],
+                         mc_returns=dataset["mc_returns"],
+                         size=len(dataset['states']))
+
+
+def make_env_and_dataset(env_name: str,
+                         seed: int,
+                         normalize_reward: bool,
+                         discount: float) -> Tuple[gym.Env, D4RLDataset]:
+    env = gym.make(env_name)
+
+    env.seed(seed)
+    env.action_space.seed(seed)
+    env.observation_space.seed(seed)
+
+    dataset = D4RLDataset(env, env_name, normalize_reward, discount=discount)
+
+    # if 'antmaze' in env_name:
+    #     # dataset.rewards -= 1.0
+    #     pass  # normalized in the batch instead
+    #     # See https://github.com/aviralkumar2907/CQL/blob/master/d4rl/examples/cql_antmaze_new.py#L22
+    #     # but I found no difference between (x - 0.5) * 4 and x - 1.0
+    # elif ('halfcheetah' in env_name or 'walker2d' in env_name
+    #       or 'hopper' in env_name):
+    #     normalize(dataset)
+
+    return env, dataset
+
+
+def concat_batches(b1, b2):
+    new_batch = {}
+    for k in b1:
+        new_batch[k] = np.concatenate((b1[k], b2[k]), axis=0)
+    return new_batch
