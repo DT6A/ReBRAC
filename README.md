@@ -71,13 +71,14 @@ PYTHONPATH=. python3 src/algorithms/rebrac_torch_vis.py --config_path="configs/r
 ### Targeted Reproduction
 For better transparency and replication, we release all the experiments (5k+) in the form of [Weights & Biases reports](https://wandb.ai/tlab/ReBRAC/reportlist).
 
-If you want to replicate results from our work, you can use the configs for [Weights & Biases Sweeps](https://docs.wandb.ai/guides/sweeps/quickstart) provided in the `configs/sweeps`. Note, we do not supply a codebase for both IQL and SAC-RND. However, in our work, we relied upon these implementations: [IQL (CORL)](https://github.com/tinkoff-ai/CORL), [SAC-RND (original implementation)](https://github.com/tinkoff-ai/sac-rnd).
+If you want to replicate results from our work, you can use the configs for [Weights & Biases Sweeps](https://docs.wandb.ai/guides/sweeps/quickstart) provided in the `configs/sweeps`. Note, we do not supply a codebase for both IQL and SAC-RND. However, in our work, we relied upon these implementations: [IQL (CORL)](https://github.com/corl-team/CORL), [SAC-RND (original implementation)](https://github.com/tinkoff-ai/sac-rnd).
 
 | Paper element          | Sweeps to run from `configs/sweeps/`                         |
 |------------------------|--------------------------------------------------------------|
 | Tables 2, 3, 4         | `eval/rebrac_d4rl_sweep.yaml`, `eval/td3_bc_d4rl_sweep.yaml` |
 | Table 5                | `eval/rebrac_visual_sweep.yaml`                              |
-| Table 6                | All sweeps from `ablations`                                  |
+| Table 6, 7             | Configs are available in `configs/finetune`                  |
+| Table 8                | All sweeps from `ablations`                                  |
 | Figure 2               | All sweeps from `network_sizes`                              |
 | Hyperparameters tuning | All sweeps from `tuning`                                     |
 
